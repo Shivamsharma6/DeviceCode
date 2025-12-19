@@ -53,7 +53,7 @@
 #define MFRC522_EXIT_SS   13
 #define MFRC522_EXIT_RST  15
 #define FACTORY_RESET_PIN   33       // primary reset button
-#define RELAY              32       // HIGH = lock; LOW = unlock
+#define RELAY              32       // relay control pin
 #define DOOR_PULSE_MS      3000     // unlock pulse ms
 
 // Memory and stability thresholds
@@ -664,6 +664,12 @@ void handleReboot() {
 
 // ---------------- [MOD] /status endpoint for diagnostics ----------------
 void handleStatus() {
+  // [FIXED] Read shared data under mutex for consistency
+  portENTER_CRITICAL(&g_activeCardsMux);
+  size_t cardsLoaded = g_activeCards.size();
+  size_t setSize = g_activeSet.size();
+  portEXIT_CRITICAL(&g_activeCardsMux);
+  
   String s = "{";
   s += "\"mac\":\"" + g_mac + "\",";
   s += "\"firmware_version\":\"" + String(FIRMWARE_VERSION) + "\",";
@@ -672,8 +678,8 @@ void handleStatus() {
   s += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
   s += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   s += "\"firebase_ready\":" + String(app.ready() ? "true" : "false") + ",";
-  s += "\"active_cards_loaded\":" + String((unsigned)g_activeCards.size()) + ",";
-  s += "\"active_set_size\":" + String((unsigned)g_activeSet.size()) + ",";
+  s += "\"active_cards_loaded\":" + String((unsigned)cardsLoaded) + ",";
+  s += "\"active_set_size\":" + String((unsigned)setSize) + ",";
   s += "\"activity_enabled\":" + String(g_activityEnabled ? "true" : "false") + ",";
   s += "\"last_heartbeat_ms\":" + String(g_lastHeartbeat) + ",";
   s += "\"last_flush_ms\":" + String(g_lastFlush) + ",";
@@ -714,7 +720,8 @@ void otaProgressCallback(size_t progress, size_t total) {
   
   // Print progress every 2 seconds to avoid spam
   if (now - lastPrint > 2000 || progress == total) {
-    int percent = (progress * 100) / total;
+    // [FIXED] Guard against division by zero
+    int percent = (total > 0) ? (progress * 100) / total : 0;
     Serial.printf("OTA Progress: %d%% (%u/%u bytes)\n", percent, progress, total);
     lastPrint = now;
     
@@ -1092,22 +1099,22 @@ void fetchActiveCardsFromFirebase_v2() {
   g_updatingActiveCards = false;
   portEXIT_CRITICAL(&g_activeCardsMux);
 
-  // 6) [FIXED] Persist access_list.json with memory optimization
+  // 6) [FIXED] Persist access_list.json using newList (thread-safe, no mutex needed)
   {
     String out;
     // Pre-allocate approximate size to avoid fragmentation
-    out.reserve(g_activeCards.size() * 80 + 10);
+    out.reserve(newList.size() * 80 + 10);
     out = "[";
-    for (size_t i = 0; i < g_activeCards.size(); ++i) {
+    for (size_t i = 0; i < newList.size(); ++i) {
       if (i) out += ",";
-      out += "{\"card_data\":\"" + g_activeCards[i].card_data + "\"";
-      out += ",\"start_time\":\"" + g_activeCards[i].start_time + "\"";
-      out += ",\"end_time\":\""   + g_activeCards[i].end_time   + "\"}";
+      out += "{\"card_data\":\"" + newList[i].card_data + "\"";
+      out += ",\"start_time\":\"" + newList[i].start_time + "\"";
+      out += ",\"end_time\":\""   + newList[i].end_time   + "\"}";
     }
     out += "]";
     bool ok = writeFile(FILE_ACCESS_LIST, out);
     if (ok) {
-      Serial.printf("Saved %u active cards to %s\n", (unsigned)g_activeCards.size(), FILE_ACCESS_LIST);
+      Serial.printf("Saved %u active cards to %s\n", (unsigned)newList.size(), FILE_ACCESS_LIST);
     } else {
       Serial.printf("ERROR: Failed to save active cards to %s\n", FILE_ACCESS_LIST);
     }
@@ -1120,16 +1127,16 @@ void fetchActiveCardsFromFirebase_v2() {
   }
   writeAccessMeta(toWriteUpdated);
 
-  // Diagnostic logging so you can inspect normalized values
+  // [FIXED] Diagnostic logging using newList (thread-safe, no mutex needed)
   Serial.printf("fetchActiveCardsFromFirebase_v2: updated in-memory list (%u entries), saved meta.\n",
-                (unsigned)g_activeCards.size());
-  Serial.printf("  g_activeSet size=%u\n", (unsigned)g_activeSet.size());
-  for (size_t i = 0; i < g_activeCards.size() && i < 12; ++i) {
-    String raw = g_activeCards[i].card_data;
+                (unsigned)newList.size());
+  Serial.printf("  g_activeSet size=%u\n", (unsigned)newList.size());
+  for (size_t i = 0; i < newList.size() && i < 12; ++i) {
+    String raw = newList[i].card_data;
     String nrm = normalizeUidStr(raw);
     Serial.printf("  sample[%u]: raw='%s' norm='%s' start=%s end=%s\n",
                   (unsigned)i, raw.c_str(), nrm.c_str(),
-                  g_activeCards[i].start_time.c_str(), g_activeCards[i].end_time.c_str());
+                  newList[i].start_time.c_str(), newList[i].end_time.c_str());
   }
 }
 
@@ -1824,11 +1831,14 @@ void queueAccessLog(const String &businessId, const String &cardId, bool granted
   }
 }
 
-// [FIXED] Thread-safe queue flush with mutex and memory checks
+// [FIXED] Thread-safe queue flush - read file under mutex, then process without mutex
 void flushQueueBatch(size_t maxLines = 50) {
   if (!(WiFi.status() == WL_CONNECTED && app.ready() && g_businessId.length())) return;
   
-  // [FIXED] Protect file operations with mutex
+  // [FIXED] Read all lines under mutex, then release before network calls
+  std::vector<String> linesToProcess;
+  std::vector<String> linesToKeep;
+  
   portENTER_CRITICAL(&g_fileMux);
   File src = SPIFFS.open(FILE_LOG_QUEUE, "r");
   if (!src) {
@@ -1837,39 +1847,52 @@ void flushQueueBatch(size_t maxLines = 50) {
   }
 
   Serial.println("Flushing access_logs queue...");
-  String keep = "";
-  size_t processed = 0;
-  int sent = 0;
-
+  size_t lineCount = 0;
+  
   while (src.available()) {
     String line = src.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) continue;
-
-    if (processed < maxLines) {
-      String bid = jsonGetStr(line, "bid");
-      String cid = jsonGetStr(line, "card");
-      String type = jsonGetStr(line, "type");
-      bool granted = (line.indexOf("\"granted\":true") >= 0);
-
-      // If queued without BID (pre-provision), use current config BID if available; else keep.
-      String effectiveBID = (bid.length() ? bid : g_businessId);
-      if (effectiveBID.length() == 0) {
-        keep += line + "\n"; // still not configured; keep it
-      } else {
-        bool ok = fsCreateAccessLogAuto(effectiveBID, cid, granted, type);
-        if (ok) sent++;
-        else    keep += line + "\n";
-      }
-      processed++;
+    
+    if (lineCount < maxLines) {
+      linesToProcess.push_back(line);
     } else {
-      keep += line + "\n";          // keep unprocessed lines
+      linesToKeep.push_back(line);
     }
+    lineCount++;
   }
   src.close();
+  portEXIT_CRITICAL(&g_fileMux);
+  
+  // [FIXED] Process lines WITHOUT holding mutex (network calls happen here)
+  int sent = 0;
+  for (const String &line : linesToProcess) {
+    String bid = jsonGetStr(line, "bid");
+    String cid = jsonGetStr(line, "card");
+    String type = jsonGetStr(line, "type");
+    bool granted = (line.indexOf("\"granted\":true") >= 0);
+
+    // If queued without BID (pre-provision), use current config BID if available; else keep.
+    String effectiveBID = (bid.length() ? bid : g_businessId);
+    if (effectiveBID.length() == 0) {
+      linesToKeep.push_back(line); // still not configured; keep it
+    } else {
+      bool ok = fsCreateAccessLogAuto(effectiveBID, cid, granted, type);
+      if (ok) sent++;
+      else    linesToKeep.push_back(line);
+    }
+  }
+  
+  // [FIXED] Write remaining lines back under mutex
+  portENTER_CRITICAL(&g_fileMux);
+  String keep = "";
+  for (const String &line : linesToKeep) {
+    keep += line + "\n";
+  }
   writeFile(FILE_LOG_QUEUE, keep);
   portEXIT_CRITICAL(&g_fileMux);
-  Serial.printf("Flushed %d/%d logs.\n", sent, (int)processed);
+  
+  Serial.printf("Flushed %d/%d logs.\n", sent, (int)linesToProcess.size());
 }
 
 // [FIXED] Improved flush logic with queue size monitoring
@@ -2117,7 +2140,7 @@ void wifiRecoveryTick() {
   if (!g_inProvWindow) {
     Serial.println("Wi-Fi not restored after lookup timeout — starting provisioning portal for a short window");
     // Normal start: don't mark as forced. startProvisionPortal() will set g_inProvWindow/g_provWindowStart.
-    startProvisionPortal(false);
+    startProvisionPortal(0);
     // Reset Wi-Fi lookup timer so after the provisioning window we get a fresh lookup window
     g_wifiFailStart = now;
   }
