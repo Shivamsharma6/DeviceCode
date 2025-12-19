@@ -119,7 +119,7 @@ static const unsigned long PROVISION_WINDOW_MS    = 5UL * 60UL * 1000UL; // 5 mi
 
 static const uint32_t CARD_CACHE_TTL_SEC = 24U * 3600U;  // 24h card cache
 static const uint32_t HEARTBEAT_MS       = 60UL * 60UL * 1000UL; // hourly = 60 * 60 * 1000
-static const uint32_t FLUSH_INTERVAL_MS  = 1UL * 60UL * 1000UL; // hourly = 60 * 60 * 1000
+static const uint32_t FLUSH_INTERVAL_MS  = 1UL * 60UL * 1000UL; // every minute = 60 * 1000
 static const float    FLUSH_FS_THRESH    = 0.80f;                 // 80% SPIFFS
 
 // runtime wifi recovery state
@@ -148,8 +148,7 @@ unsigned long g_lastHeartbeat = 0;
 unsigned long g_lastFlush     = 0;
 
 // Runtime reset state (non-blocking)
-unsigned long g_resetPressStart = 0;   // when button first seen pressed
-bool g_resetArmed = false;             // true while waiting for release after trigger
+// Note: pressStart and pressed state are local static in runtimeResetTick()
 const unsigned long RESET_CONFIRM_MS = 3000UL; // require 3s hold to confirm reset
 
 const unsigned long RESET_SHORT_MS = 1000UL;  // >=1s on release => soft restart
@@ -422,8 +421,12 @@ String escapeJson(const String &s) {
   out.reserve(s.length() + 10);
   for (size_t i = 0; i < s.length(); ++i) {
     char c = s[i];
-    if (c == '\"')  { out += "\\\\\""; }
-    else if (c == '\\') { out += "\\\\\\\\"; }
+    // [FIXED] Correct JSON escaping: " becomes \" and \ becomes \\
+    if (c == '"')       { out += "\\"; out += '"'; }
+    else if (c == '\\') { out += "\\"; out += '\\'; }
+    else if (c == '\n') { out += "\\"; out += 'n'; }
+    else if (c == '\r') { out += "\\"; out += 'r'; }
+    else if (c == '\t') { out += "\\"; out += 't'; }
     else out += c;
   }
   return out;
@@ -742,6 +745,8 @@ bool performOtaUpdate(const String &url) {
   if (!http.begin(client, url)) {
     Serial.println("OTA: Failed to begin HTTP connection");
     g_otaInProgress = false;
+    g_otaUpdateAvailable = false; // [FIXED] Clear state on failure
+    g_otaUpdateUrl = "";
     // Re-enable watchdog
     esp_task_wdt_add(NULL);
     return false;
@@ -752,6 +757,8 @@ bool performOtaUpdate(const String &url) {
     Serial.printf("OTA: HTTP GET failed, code=%d\n", httpCode);
     http.end();
     g_otaInProgress = false;
+    g_otaUpdateAvailable = false; // [FIXED] Clear state on failure
+    g_otaUpdateUrl = "";
     esp_task_wdt_add(NULL);
     return false;
   }
@@ -761,6 +768,8 @@ bool performOtaUpdate(const String &url) {
     Serial.println("OTA: Invalid content length");
     http.end();
     g_otaInProgress = false;
+    g_otaUpdateAvailable = false; // [FIXED] Clear state on failure
+    g_otaUpdateUrl = "";
     esp_task_wdt_add(NULL);
     return false;
   }
@@ -772,6 +781,8 @@ bool performOtaUpdate(const String &url) {
     Serial.printf("OTA: Not enough space. Error=%d\n", Update.getError());
     http.end();
     g_otaInProgress = false;
+    g_otaUpdateAvailable = false; // [FIXED] Clear state on failure
+    g_otaUpdateUrl = "";
     esp_task_wdt_add(NULL);
     return false;
   }
@@ -783,11 +794,13 @@ bool performOtaUpdate(const String &url) {
   WiFiClient *stream = http.getStreamPtr();
   size_t written = Update.writeStream(*stream);
   
-  if (written != contentLength) {
-    Serial.printf("OTA: Write failed. Written=%u Expected=%d\n", written, contentLength);
+  if (written != (size_t)contentLength) {
+    Serial.printf("OTA: Write failed. Written=%u Expected=%d\n", (unsigned)written, contentLength);
     Update.abort();
     http.end();
     g_otaInProgress = false;
+    g_otaUpdateAvailable = false; // [FIXED] Clear state on failure
+    g_otaUpdateUrl = "";
     esp_task_wdt_add(NULL);
     return false;
   }
@@ -798,6 +811,8 @@ bool performOtaUpdate(const String &url) {
     Serial.printf("OTA: Update.end() failed. Error=%d\n", Update.getError());
     http.end();
     g_otaInProgress = false;
+    g_otaUpdateAvailable = false; // [FIXED] Clear state on failure
+    g_otaUpdateUrl = "";
     esp_task_wdt_add(NULL);
     return false;
   }
@@ -806,6 +821,8 @@ bool performOtaUpdate(const String &url) {
     Serial.println("OTA: Update not finished");
     http.end();
     g_otaInProgress = false;
+    g_otaUpdateAvailable = false; // [FIXED] Clear state on failure
+    g_otaUpdateUrl = "";
     esp_task_wdt_add(NULL);
     return false;
   }
@@ -1127,6 +1144,8 @@ bool findActiveCardTimes(const String &uid, const String &checkTargetHHMM, Strin
   // [FIXED] Protect read access to g_activeCards
   portENTER_CRITICAL(&g_activeCardsMux);
   bool anyFound = false;
+  bool matchedShift = false;
+  
   for (auto &e : g_activeCards) {
     String ne = normalizeUidStr(e.card_data);
     if (ne == nuid) {
@@ -1135,18 +1154,20 @@ bool findActiveCardTimes(const String &uid, const String &checkTargetHHMM, Strin
         if (timeInRange(e.start_time, e.end_time, checkTargetHHMM)) {
           outStart = e.start_time;
           outEnd   = e.end_time;
-          return true;
+          matchedShift = true;
+          break; // [FIXED] Don't return inside critical section
         }
       } else {
         outStart = e.start_time;
         outEnd   = e.end_time;
-        return true;
+        matchedShift = true;
+        break; // [FIXED] Don't return inside critical section
       }
     }
   }
 
   // If at least one entry exists but none matched the target, return first entry (for diagnostics) but report false.
-  if (anyFound) {
+  if (anyFound && !matchedShift) {
     for (auto &e : g_activeCards) {
       String ne = normalizeUidStr(e.card_data);
       if (ne == nuid) {
@@ -1157,7 +1178,7 @@ bool findActiveCardTimes(const String &uid, const String &checkTargetHHMM, Strin
     }
   }
   portEXIT_CRITICAL(&g_activeCardsMux);
-  return false;
+  return matchedShift;
 }
 // ----------------------------------------------------------------------------
 
@@ -2264,7 +2285,7 @@ void setup() {
   Serial.printf("Version: %s\n", FIRMWARE_VERSION);
   Serial.printf("Build Date: %s\n", FIRMWARE_BUILD_DATE);
   Serial.printf("Current Version: %s\n", readFirmwareVersion().c_str());
-  Serial.println("=====================")
+  Serial.println("=====================");
 
   // === CONFIG / PROVISIONING DECISION ===
   feedWatchdog();
@@ -2438,26 +2459,15 @@ void loop() {
           // matched a shift containing current time
           grant = true;
         } else {
-          // [FIXED] Optimized diagnostic output - only show first 3 shifts
-          Serial.printf("ENTRY: UID present but no matching shift for nowHM=%s\n", nowHM.c_str());
-          int printed = 0;
-          for (auto &e : g_activeCards) {
-            if (printed >= 3) break; // limit diagnostic output
-            if (normalizeUidStr(e.card_data) == uidNorm) {
-              Serial.printf("  shift: %s-%s\n", e.start_time.c_str(), e.end_time.c_str());
-              printed++;
-            }
-          }
+          // [FIXED] Optimized diagnostic output - show shift info from findActiveCardTimes
+          Serial.printf("ENTRY: UID present but no matching shift for nowHM=%s (card shift: %s-%s)\n", 
+                        nowHM.c_str(), st.c_str(), et.c_str());
           grant = false;
         }
       }
     } else {
-      // not found in active_cards -> diagnostic info
-      bool foundCI = false;
-      for (auto &e : g_activeCards) {
-        if (e.card_data.equalsIgnoreCase(uid)) { foundCI = true; break; }
-      }
-      // [FIXED] Reduced diagnostic verbosity
+      // not found in active_cards
+      // [FIXED] Reduced diagnostic verbosity - removed unused foundCI check
       Serial.printf("ENTRY denied: card=%s not in active set (size=%u)\n",
                     uidNorm.c_str(), (unsigned)g_activeSet.size());
       grant = false;
@@ -2492,15 +2502,10 @@ void loop() {
     if (foundInSet) {
       grant = true;
     } else {
-      // Diagnostic info to help find mismatches
-      bool foundCI = false;
-      for (auto &e : g_activeCards) {
-        if (e.card_data.equalsIgnoreCase(uid2)) { foundCI = true; break; }
-      }
-      // [FIXED] Reduced diagnostic verbosity
+      // not found in active_cards
+      // [FIXED] Reduced diagnostic verbosity - removed unused foundCI check
       Serial.printf("EXIT denied: card=%s not in active set (size=%u)\n",
                     uid2Norm.c_str(), (unsigned)g_activeSet.size());
-
       grant = false;
     }
 
