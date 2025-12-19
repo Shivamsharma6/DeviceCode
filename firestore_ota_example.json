@@ -1,0 +1,17 @@
+{
+  "firmware_updates": {
+    "latest": {
+      "version": "1.0.1",
+      "download_url": "https://your-server.com/firmware/device_v1.0.1.bin",
+      "mandatory": false,
+      "release_notes": "Bug fixes and performance improvements",
+      "min_version": "1.0.0",
+      "released_at": "2024-12-19T08:21:00Z",
+      "changelog": [
+        "Fixed RFID debouncing issue",
+        "Improved memory management",
+        "Added OTA update support"
+      ]
+    }
+  }
+}
