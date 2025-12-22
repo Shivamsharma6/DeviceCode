@@ -2053,8 +2053,13 @@ void wifiRecoveryTick() {
     // If portal is active and we have a forced window that hasn't expired, keep the portal open.
     if (g_portalActive) {
       if (g_forcedProvUntil != 0 && now < g_forcedProvUntil) {
-        Serial.printf("Wi-Fi connected but portal forced open until +%lus. Keeping AP.\n",
-                      (unsigned long)((g_forcedProvUntil - now) / 1000));
+        // [FIXED] Rate-limit this log to avoid flooding serial
+        static unsigned long lastForcedLog = 0;
+        if (now - lastForcedLog >= 10000) {
+          Serial.printf("Wi-Fi connected but portal forced open until +%lus. Keeping AP.\n",
+                        (unsigned long)((g_forcedProvUntil - now) / 1000));
+          lastForcedLog = now;
+        }
         return;
       }
 
@@ -2066,8 +2071,13 @@ void wifiRecoveryTick() {
           g_inProvWindow = false;
           g_provWindowStart = 0;
         } else {
-          unsigned long remain = (PROVISION_WINDOW_MS - (now - g_provWindowStart)) / 1000;
-          Serial.printf("Portal active (normal) — keeping AP for another %lus.\n", remain);
+          // [FIXED] Rate-limit this log to avoid flooding serial
+          static unsigned long lastNormalLog = 0;
+          if (now - lastNormalLog >= 10000) {
+            unsigned long remain = (PROVISION_WINDOW_MS - (now - g_provWindowStart)) / 1000;
+            Serial.printf("Portal active (normal) — keeping AP for another %lus.\n", remain);
+            lastNormalLog = now;
+          }
           return;
         }
       } else {
@@ -2444,16 +2454,21 @@ void loop() {
   // Non-blocking firebase poll / initialization
   firebaseInitPoll();
 
-  // Let SDK do a light loop as well (small, non-blocking)
-  if (!g_firebaseInitInProgress) {
+  // [FIXED] Only run Firebase SDK loops when WiFi is connected and not in portal-only mode
+  if (!g_firebaseInitInProgress && WiFi.status() == WL_CONNECTED) {
     app.loop();
     Docs.loop();
   }
 
-  // periodic tasks
-  heartbeat();          // hourly device upsert + device_status refresh
-  flushQueueIfNeeded(); // hourly or when SPIFFS >= threshold or queue too large
-  checkForOtaUpdates(); // check for firmware updates (throttled internally)
+  // periodic tasks (only when not in portal-only mode)
+  if (WiFi.status() == WL_CONNECTED) {
+    heartbeat();          // hourly device upsert + device_status refresh
+    flushQueueIfNeeded(); // hourly or when SPIFFS >= threshold or queue too large
+    checkForOtaUpdates(); // check for firmware updates (throttled internally)
+  }
+  
+  // [FIXED] Small yield to prevent tight loop and allow background tasks
+  delay(1);
 
   // ---------- RFID ENTRY ----------
   // [FIXED] Use debounced reader with state tracking
